@@ -62,4 +62,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    print("udp_receiver.py downloaded successfully.")
