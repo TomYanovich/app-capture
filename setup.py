@@ -6,6 +6,7 @@ import subprocess
 
 UDP_RECEIVER_URL = "https://raw.githubusercontent.com/emanuele-f/PCAPdroid/refs/heads/master/tools/udp_receiver.py"
 
+
 class bcolors:
     HEADER = '\033[95m'
     OKBLUE = '\033[94m'
@@ -36,12 +37,14 @@ def main():
 
     is_wireshark_installed = which("wireshark")
     if not is_wireshark_installed:
-        print(f"{bcolors.FAIL}* Wireshark is not installed. Please install it to use this script.{bcolors.ENDC}\nRun:\n\tsudo apt install wireshark\n-----------------------------------------")
+        print(
+            f"{bcolors.FAIL}* Wireshark is not installed. Please install it to use this script.{bcolors.ENDC}\nRun:\n\tsudo apt install wireshark\n-----------------------------------------")
         exit(1)
 
     is_adb_installed = which("adb")
     if not is_adb_installed:
-        print(f"{bcolors.FAIL}* ADB is not installed. Please install it to use this script.{bcolors.ENDC}\nRun:\n\tsudo add-apt-repository ppa:nilarimogard/webupd8\n\tsudo apt update\n\tsudo apt install android-tools-adb\n-----------------------------------------")
+        print(
+            f"{bcolors.FAIL}* ADB is not installed. Please install it to use this script.{bcolors.ENDC}\nRun:\n\tsudo add-apt-repository ppa:nilarimogard/webupd8\n\tsudo apt update\n\tsudo apt install android-tools-adb\n-----------------------------------------")
         exit(1)
 
     is_pcapdroid_installed = False
@@ -57,7 +60,6 @@ def main():
         exit(1)
 
     print(f"{bcolors.OKGREEN}All dependencies are installed. You can now run the app-capture.py script.{bcolors.ENDC}")
-
 
 
 if __name__ == '__main__':

@@ -8,6 +8,7 @@ Capture traffic from an android app and analyze it live with Wireshark
 2. [`PCAPdroid`](https://play.google.com/store/apps/details?id=com.emanuelef.remote_capture) app installed on your
    Android.
 3. [`adb`](https://developer.android.com/tools/adb) and [`Wireshark`](https://www.wireshark.org/) installed on your PC.
+4. Make sure both your PC and Android are connected to the same network.
 
 ## Install
 
