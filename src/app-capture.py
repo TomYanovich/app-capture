@@ -1,5 +1,5 @@
 import argparse
-import getpass
+import threading
 import platformdirs
 from pathlib import Path
 import shlex
@@ -7,6 +7,11 @@ import socket
 import subprocess
 import time
 from typing import List
+
+APP_NAME = "app-capture"
+API_KEY_FILENAME = "api_key.txt"
+DEFAULT_LOGCAT_FILENAME = "logcat.log"
+
 
 class bcolors:
     HEADER = '\033[95m'
@@ -18,6 +23,14 @@ class bcolors:
     ENDC = '\033[0m'
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
+
+
+def adb_cmd(serial: str | None) -> List[str]:
+    arr = ["adb"]
+    if serial:
+        arr.extend(["-s", serial])
+    return arr
+
 
 def cleanup(running_processes: List[subprocess.Popen], verbose: bool = False) -> None:
     timeout_sec = 5
@@ -53,9 +66,7 @@ def check_if_port_is_open(port: int) -> bool:
 
 def check_ping_from_android(serial: str, host: str, verbose: bool = False) -> bool:
     try:
-        ping_cmd = ["adb"]
-        if serial:
-            ping_cmd.extend(["-s", serial])
+        ping_cmd = adb_cmd(serial)
         ping_cmd.extend(["shell", "ping", "-c", "1", host])
         if verbose:
             print(shlex.join(ping_cmd))
@@ -64,6 +75,39 @@ def check_ping_from_android(serial: str, host: str, verbose: bool = False) -> bo
         return "1 received" in output
     except (subprocess.SubprocessError, RuntimeError) as e:
         return False
+
+
+def pidof(package: str, serial: str | None = None, verbose: bool = False) -> int:
+    pidof_cmd = adb_cmd(serial)
+    pidof_cmd.extend(["shell", "pidof", package])
+    if verbose:
+        print(shlex.join(pidof_cmd))
+    pid = int(subprocess.check_output(shlex.join(pidof_cmd), shell=True, text=True).strip())
+    return pid
+
+
+def stream_logcat(outfile: str, serial: str | None = None, package: str | None = None, verbose: bool = False):
+    def logcat_thread():
+        logcat_cmd = adb_cmd(serial)
+        logcat_cmd.append("logcat")
+        if package:
+            pid = pidof(package=package, serial=serial, verbose=verbose)
+            logcat_cmd.extend(["--pid", str(pid)])
+        logcat_cmd.extend(["-v", "time"])
+        proc = subprocess.Popen(shlex.join(logcat_cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True,
+                                text=True)
+
+        with open(outfile, "w") as f:
+            try:
+                for line in proc.stdout:
+                    f.write(line)
+            except Exception as e:
+                print(f"Error reading logcat output: {e}")
+            finally:
+                proc.terminate()
+
+    thread = threading.Thread(target=logcat_thread, daemon=True)
+    thread.start()
 
 
 def start_collector(collector_port: int | None = 1234, verbose: bool = False, write: str = "-") -> List[
@@ -87,7 +131,7 @@ def start_collector(collector_port: int | None = 1234, verbose: bool = False, wr
         print(wireshark_cmd)
     with subprocess.Popen(wireshark_cmd, stdin=collector_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           shell=True) as wireshark_proc:
-        password = getpass.getpass()
+        password = input()
         stdout, stderr = wireshark_proc.communicate(input=password.encode())
         if wireshark_proc.returncode == 0:
             if verbose:
@@ -119,7 +163,8 @@ def stop_capture(api_key: str, serial: str | None = None, verbose: bool = False)
 
     if verbose:
         print(shlex.join(pcapdroid_cmd))
-    with subprocess.run(shlex.join(pcapdroid_cmd), shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True) as pcapdroid_cmd:
+    with subprocess.run(shlex.join(pcapdroid_cmd), shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        check=True) as pcapdroid_cmd:
         stdout, stderr = pcapdroid_cmd.communicate()
         if verbose and stdout:
             print(f"PCAPdroid stopped successfully.")
@@ -146,7 +191,8 @@ def get_package_list(serial: str, verbose: bool = False) -> List[str]:
             if line.startswith("package:"):
                 packages.append(line[8:].strip())
     except subprocess.CalledProcessError:
-        print(f"{bcolors.FAIL}Failed to retrieve package list. Ensure ADB is connected and the device is online.{bcolors.ENDC}")
+        print(
+            f"{bcolors.FAIL}Failed to retrieve package list. Ensure ADB is connected and the device is online.{bcolors.ENDC}")
         exit(1)
 
     return packages
@@ -181,10 +227,11 @@ def start_capture(api_key: str, collector_ip_address: str, target_app: str | Non
     if verbose:
         print(shlex.join(pcapdroid_cmd))
 
-    with subprocess.Popen(shlex.join(pcapdroid_cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True) as pcapdroid_proc:
+    with subprocess.Popen(shlex.join(pcapdroid_cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          shell=True) as pcapdroid_proc:
         stdout, stderr = pcapdroid_proc.communicate()
         if verbose and stdout:
-                print(f"PCAPdroid started successfully.")
+            print(f"PCAPdroid started successfully.")
         if stderr:
             print(f"{bcolors.FAIL}Error starting PCAPdroid: {stderr.decode()}{bcolors.ENDC}")
     return pcapdroid_proc
@@ -192,7 +239,7 @@ def start_capture(api_key: str, collector_ip_address: str, target_app: str | Non
 
 if __name__ == '__main__':
     api_key = None
-    api_key_file = Path(platformdirs.user_cache_dir("app-capture")) / "api_key.txt"
+    api_key_file = Path(platformdirs.user_cache_dir(APP_NAME)) / API_KEY_FILENAME
     api_key_file.parent.mkdir(parents=True, exist_ok=True)
     if api_key_file.exists():
         with open(api_key_file, "r") as f:
@@ -208,13 +255,16 @@ if __name__ == '__main__':
                         help="Target app to capture data from (for example, com.android.chrome).")
     parser.add_argument("-k", "--api-key", type=str, required=True if api_key is None else False,
                         help="API key for the PCAPdroid app.")
+    parser.add_argument("-l", "--logcat-file", type=str, default=DEFAULT_LOGCAT_FILENAME, help="Logcat file name")
 
+    # Check that the package name is valid
     args = parser.parse_args()
     installed_packages = get_package_list(serial=args.serial, verbose=args.verbose)
     if args.target_app not in installed_packages:
         print(f"{bcolors.FAIL}package {args.target_app} is not installed.{bcolors.ENDC}")
         exit(1)
 
+    # Cache api_key, or get from cache
     if args.api_key:
         with open(api_key_file, "w") as f:
             f.write(args.api_key)
@@ -227,6 +277,12 @@ if __name__ == '__main__':
 
     processes = []
     try:
+        logcat_file = Path(platformdirs.user_log_dir(APP_NAME)) / args.logcat_file
+        logcat_file.parent.mkdir(parents=True, exist_ok=True)
+        if args.verbose:
+            print(f"Logging {args.target_app} log to {logcat_file}")
+        stream_logcat(serial=args.serial, package=args.target_app, verbose=args.verbose, outfile=str(logcat_file))
+
         local_ip_address = get_local_ip_address()
         if args.verbose:
             print(f"Local IP address: {local_ip_address}")
