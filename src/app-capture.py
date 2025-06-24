@@ -1,12 +1,15 @@
 import argparse
+import fcntl
+import os
+import struct
 import threading
+import time
+
 import platformdirs
 from pathlib import Path
 import shlex
-import socket
-import subprocess
-import time
-from typing import List
+from ppadb.client import Client as AdbClient
+from scapy.all import *
 
 APP_NAME = "app-capture"
 API_KEY_FILENAME = "api_key.txt"
@@ -25,25 +28,37 @@ class bcolors:
     UNDERLINE = '\033[4m'
 
 
-def adb_cmd(serial: str | None) -> List[str]:
-    arr = ["adb"]
-    if serial:
-        arr.extend(["-s", serial])
-    return arr
-
-
-def cleanup(running_processes: List[subprocess.Popen], verbose: bool = False) -> None:
-    timeout_sec = 5
-    for p in running_processes:
-        p_sec = 0
-        for second in range(timeout_sec):
-            if p.poll() is None:
-                time.sleep(1)
-                p_sec += 1
-        if p_sec >= timeout_sec:
-            p.kill()
+def create_tun(name='tun0', verbose: bool = False) -> int:
+    link_show_cmd = shlex.join(["ip", "link", "show", name])
     if verbose:
-        print("Cleanup completed.")
+        print(link_show_cmd)
+    output1 = subprocess.run(link_show_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=True)
+    if output1.returncode == 0:
+        if verbose:
+            print(f"TUN device {name} already exists.")
+    else:
+        # the device does not exist, create it
+        add_device_cmd = shlex.join(["sudo", "ip", "tuntap", "add", "dev", name, "mode", "tun"])
+        if verbose:
+            print(add_device_cmd)
+        out1 = subprocess.check_output(add_device_cmd, shell=True)
+        if verbose:
+            print(bcolors.OKBLUE + out1.decode() + bcolors.ENDC)
+        else:
+            print(out1.decode().strip())
+
+    set_link_up_cmd = shlex.join(["sudo", "ip", "link", "set", name, "up"])
+    if verbose:
+        print(set_link_up_cmd)
+    subprocess.run(set_link_up_cmd, shell=True)
+
+    TUN_SET_IFF = 0x400454ca  # TUNSETIFF ioctl command
+    IFF_TAP = 0x0002
+    IFF_NO_PI = 0x1000
+    tun = os.open('/dev/net/tun', os.O_RDWR | os.O_NONBLOCK)
+    ifr = struct.pack('16sH', name.encode('utf-8'), IFF_TAP | IFF_NO_PI)
+    fcntl.ioctl(tun, TUN_SET_IFF, ifr)
+    return tun
 
 
 def get_local_ip_address() -> str:
@@ -64,177 +79,123 @@ def check_if_port_is_open(port: int) -> bool:
             return False
 
 
-def check_ping_from_android(serial: str, host: str, verbose: bool = False) -> bool:
-    try:
-        ping_cmd = adb_cmd(serial)
-        ping_cmd.extend(["shell", "ping", "-c", "1", host])
-        if verbose:
-            print(shlex.join(ping_cmd))
-        output = subprocess.check_output(shlex.join(ping_cmd), stderr=subprocess.DEVNULL, text=True, shell=True,
-                                         timeout=5)
-        return "1 received" in output
-    except (subprocess.SubprocessError, RuntimeError) as e:
-        return False
-
-
 def pidof(package: str, serial: str | None = None, verbose: bool = False) -> int:
-    pidof_cmd = adb_cmd(serial)
-    pidof_cmd.extend(["shell", "pidof", package])
+    adb_client = AdbClient()
+    device = adb_client.device(serial)
+    pidof_cmd = "pidof " + package
     if verbose:
-        print(shlex.join(pidof_cmd))
-    pid = int(subprocess.check_output(shlex.join(pidof_cmd), shell=True, text=True).strip())
+        print(pidof_cmd)
+    output = device.shell(pidof_cmd)
+    pid = int(output.strip())
+    if verbose:
+        print(bcolors.OKBLUE + output + bcolors.ENDC)
     return pid
 
 
 def stream_logcat(outfile: str, serial: str | None = None, package: str | None = None, verbose: bool = False):
-    def logcat_thread():
-        logcat_cmd = adb_cmd(serial)
-        logcat_cmd.append("logcat")
-        if package:
-            pid = pidof(package=package, serial=serial, verbose=verbose)
-            logcat_cmd.extend(["--pid", str(pid)])
-        logcat_cmd.extend(["-v", "time"])
-        proc = subprocess.Popen(shlex.join(logcat_cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True,
-                                text=True)
+    def logcat_thread(filename: str, pid: int | None = None):
+        adb_client = AdbClient()
+        device = adb_client.device(serial)
+        with open(filename, "w", encoding="utf-8") as f:
+            logcat_cmd = f"logcat --pid {pid} -v time" if pid else "logcat -v time"
+            if verbose:
+                print(logcat_cmd)
 
-        with open(outfile, "w") as f:
-            try:
-                for line in proc.stdout:
-                    f.write(line)
-            except Exception as e:
-                print(f"Error reading logcat output: {e}")
-            finally:
-                proc.terminate()
+            for line in device.shell(logcat_cmd):
+                f.write(line)
+                f.flush()
 
-    thread = threading.Thread(target=logcat_thread, daemon=True)
+    pid = pidof(package=package, serial=serial, verbose=verbose)
+    thread = threading.Thread(target=logcat_thread, args=(outfile, pid), daemon=True)
     thread.start()
 
 
-def start_collector(collector_port: int | None = 1234, verbose: bool = False, write: str = "-") -> List[
-    subprocess.Popen]:
-    arguments = ["python", "udp_receiver.py"]
-    if collector_port and collector_port != 1234:
-        arguments.extend(["-p", str(collector_port)])
-    if verbose:
-        arguments.append("-v")
-    if write and write != "-":
-        arguments.extend(["-w", write])
+def sniff(collector_port: int | None = 1234, verbose: bool = False, write: str = "-"):
+    """
+    Start a UDP socket to listen for PCAP packets from PCAPdroid and write them to a file or stdout.
+    based on https://raw.githubusercontent.com/emanuele-f/PCAPdroid/refs/heads/master/tools/udp_receiver.py
+    Args:
+        collector_port: int, default 1234: Port for the collector to listen on.
+        verbose: Enable verbose logging.
+        write: str, default "-": File to write the PCAP data to (default: stdout). If "-", write to stdout.
 
-    collector_cmd = shlex.join(arguments)
-    if verbose:
-        print(collector_cmd)
-    collector_proc = subprocess.Popen(collector_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True,
-                                      text=True)
+    Returns:
 
-    wireshark_cmd = shlex.join(["sudo", "wireshark", "-k", "-i", "-"])
-    if verbose:
-        print(wireshark_cmd)
-    with subprocess.Popen(wireshark_cmd, stdin=collector_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          shell=True) as wireshark_proc:
-        password = input()
-        stdout, stderr = wireshark_proc.communicate(input=password.encode())
-        if wireshark_proc.returncode == 0:
-            if verbose:
-                for line in stdout.splitlines():
-                    print(line)
-                print("Wireshark started successfully.")
-        else:
-            if verbose:
-                for line in stderr.splitlines():
-                    print(line)
-                print(f"{bcolors.FAIL}Error starting Wireshark: {stderr.decode()}{bcolors.ENDC}")
-            raise RuntimeError("Failed to start Wireshark.")
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", collector_port))
+    BUFSIZE = 65535
+    PCAP_HEADER_SIZE = 24
 
-    return [collector_proc, wireshark_proc]  # Return the processes for cleanup
+    # Standard PCAP header (struct pcap_hdr_s). Must be sent before any other PCAP record (struct pcaprec_hdr_s).
+    # magic: 0xa1b2c3d4, v2.4
+    PCAP_HDR_BYTES_PREFIX = bytes.fromhex("d4c3b2a1020004000000000000000000")
+    pcapdroid_fd = create_tun("pcapdroid", verbose=args.verbose)
+
+    def write_packets_to_fd():
+        while True:
+            data, addr = sock.recvfrom(BUFSIZE)
+            is_pcap_header = (len(data) == PCAP_HEADER_SIZE) and (data.startswith(PCAP_HDR_BYTES_PREFIX))
+            if is_pcap_header:
+                continue
+            os.write(pcapdroid_fd, b'\x00' * 6 + b'\x00' * 6 + b'\x08\x00' + bytes(
+                data[16:]))  # Skip the first 16 bytes (PCAP header)
+
+    fd_writer_thread = threading.Thread(target=write_packets_to_fd, daemon=True)
+    fd_writer_thread.start()
 
 
 def stop_capture(api_key: str, serial: str | None = None, verbose: bool = False) -> None:
     """
     API documentation: https://github.com/emanuele-f/PCAPdroid/blob/master/docs/app_api.md
     Args:
+        verbose: Enable verbose logging.
         api_key: PCAPdroid API key.
         serial: adb device serial number, if multiple devices are connected.
     """
-    pcapdroid_cmd = ["adb"]
-    if serial:
-        pcapdroid_cmd.extend(["-s", serial])
-    pcapdroid_cmd.extend(["shell", "am", "start", "-e", "action", "stop", "-e", "api_key", api_key,
-                          "-n", "com.emanuelef.remote_capture/.activities.CaptureCtrl"])
+    adb_client = AdbClient()
+    device = adb_client.device(serial)
+    stop_capture_args = ["am", "start", "-e", "action", "stop", "-e", "api_key", api_key,
+                         "-n", "com.emanuelef.remote_capture/.activities.CaptureCtrl"]
 
+    stop_capture_cmd = shlex.join(stop_capture_args)
     if verbose:
-        print(shlex.join(pcapdroid_cmd))
-    with subprocess.run(shlex.join(pcapdroid_cmd), shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        check=True) as pcapdroid_cmd:
-        stdout, stderr = pcapdroid_cmd.communicate()
-        if verbose and stdout:
-            print(f"PCAPdroid stopped successfully.")
-        if stderr:
-            print(f"{bcolors.FAIL}Error stopping PCAPdroid: {stderr.decode()}{bcolors.ENDC}")
-
+        print(stop_capture_cmd)
+    output = device.shell(stop_capture_cmd)
     if verbose:
-        print("Capture stopped.")
-
-
-def get_package_list(serial: str, verbose: bool = False) -> List[str]:
-    list_packages_cmd = ["adb"]
-    if serial:
-        list_packages_cmd.extend(["-s", serial])
-    list_packages_cmd.extend(["shell", "pm", "list", "packages"])
-
-    if verbose:
-        print(shlex.join(list_packages_cmd))
-
-    packages = []
-    try:
-        packages_output = subprocess.check_output(shlex.join(list_packages_cmd), shell=True, text=True)
-        for line in packages_output.split():
-            if line.startswith("package:"):
-                packages.append(line[8:].strip())
-    except subprocess.CalledProcessError:
-        print(
-            f"{bcolors.FAIL}Failed to retrieve package list. Ensure ADB is connected and the device is online.{bcolors.ENDC}")
-        exit(1)
-
-    return packages
+        print(bcolors.OKBLUE + output + bcolors.ENDC)
 
 
 def start_capture(api_key: str, collector_ip_address: str, target_app: str | None = None, collector_port: int = 1234,
-                  serial: str | None = None, verbose: bool = False) -> subprocess.Popen:
+                  serial: str | None = None, verbose: bool = False):
     """
     API codumentation: https://github.com/emanuele-f/PCAPdroid/blob/master/docs/app_api.md
     Args:
+        verbose:
         collector_ip_address: IP address of the collector to send the captured data to.
         api_key: PCAPdroid API key.
-        target_app: apacke name to filter the capture (for example, com.android.chrome).
+        target_app: app package name to filter the capture (for example, com.android.chrome).
         collector_port: int, default 1234: Port for the collector to listen on.
         serial: adb device serial number, if multiple devices are connected.
 
     Returns:
 
     """
-    pcapdroid_cmd = ["adb"]
-    if serial:
-        pcapdroid_cmd.extend(["-s", serial])
-    pcapdroid_cmd.extend(["shell", "am", "start", "-e", "action", "start", "-e", "api_key",
-                          api_key, "-e", "pcap_dump_mode", "udp_exporter", "-e", "collector_ip_address",
-                          collector_ip_address,
-                          "-e", "collector_port", str(collector_port)])
+    adb_client = AdbClient()
+    device = adb_client.device(serial)
+    start_capture_args = ["am", "start", "-e", "action", "start", "-e", "api_key", api_key, "-e", "pcap_dump_mode",
+                          "udp_exporter", "-e", "collector_ip_address", collector_ip_address, "-e", "collector_port",
+                          str(collector_port)]
     if target_app:
-        pcapdroid_cmd.extend(["-e", "app_filter", target_app])
-    pcapdroid_cmd.extend(["-n", "com.emanuelef.remote_capture/.activities.CaptureCtrl"])
+        start_capture_args.extend(["-e", "app_filter", target_app])
+    start_capture_args.extend(["-n", "com.emanuelef.remote_capture/.activities.CaptureCtrl"])
 
-    time.sleep(2)
+    start_capture_cmd = shlex.join(start_capture_args)
     if verbose:
-        print(shlex.join(pcapdroid_cmd))
-
-    with subprocess.Popen(shlex.join(pcapdroid_cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          shell=True) as pcapdroid_proc:
-        stdout, stderr = pcapdroid_proc.communicate()
-        if verbose and stdout:
-            print(f"PCAPdroid started successfully.")
-        if stderr:
-            print(f"{bcolors.FAIL}Error starting PCAPdroid: {stderr.decode()}{bcolors.ENDC}")
-    return pcapdroid_proc
+        print(start_capture_cmd)
+    output = device.shell(start_capture_cmd)
+    if verbose:
+        print(bcolors.OKBLUE + output + bcolors.ENDC)
 
 
 if __name__ == '__main__':
@@ -245,12 +206,15 @@ if __name__ == '__main__':
         with open(api_key_file, "r") as f:
             api_key = f.read().strip()
 
+    adb_client = AdbClient()
+
     parser = argparse.ArgumentParser(description="Start PCAPdroid collector and capture.")
     parser.add_argument("-p", "--collector-port", type=int, default=1234, help="Port for the collector to listen on.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging.")
     parser.add_argument("-w", "--write", type=str, default="-",
                         help="File to write the PCAP data to (default: stdout).")
-    parser.add_argument("-s", "--serial", type=str, help="ADB device serial number.")
+    parser.add_argument("-s", "--serial", type=str, choices=[dev.serial for dev in adb_client.devices()],
+                        help="ADB device serial number.")
     parser.add_argument("-a", "--target-app", type=str,
                         help="Target app to capture data from (for example, com.android.chrome).")
     parser.add_argument("-k", "--api-key", type=str, required=True if api_key is None else False,
@@ -259,8 +223,13 @@ if __name__ == '__main__':
 
     # Check that the package name is valid
     args = parser.parse_args()
-    installed_packages = get_package_list(serial=args.serial, verbose=args.verbose)
-    if args.target_app not in installed_packages:
+
+    serial = None
+    if not args.serial:
+        serial = adb_client.devices()[0].serial
+
+    device = adb_client.device(serial)
+    if not device.is_installed(args.target_app):
         print(f"{bcolors.FAIL}package {args.target_app} is not installed.{bcolors.ENDC}")
         exit(1)
 
@@ -275,34 +244,31 @@ if __name__ == '__main__':
             print(f"Using API key from {api_key_file}")
         args.api_key = api_key
 
-    processes = []
     try:
+        # handle logcat streaming
         logcat_file = Path(platformdirs.user_log_dir(APP_NAME)) / args.logcat_file
         logcat_file.parent.mkdir(parents=True, exist_ok=True)
         if args.verbose:
             print(f"Logging {args.target_app} log to {logcat_file}")
-        stream_logcat(serial=args.serial, package=args.target_app, verbose=args.verbose, outfile=str(logcat_file))
+        stream_logcat(serial=serial, package=args.target_app, verbose=args.verbose, outfile=str(logcat_file))
 
+        # handle packet capture
         local_ip_address = get_local_ip_address()
         if args.verbose:
             print(f"Local IP address: {local_ip_address}")
             print("starting capture...")
-        pcapdroid_proc = start_capture(serial=args.serial, collector_ip_address=local_ip_address,
-                                       target_app=args.target_app, api_key=args.api_key, verbose=args.verbose)
-        processes.append(pcapdroid_proc)
 
+        time.sleep(1)
+        # handle local packet collector
         if args.verbose:
             print("starting collector...")
-        is_port_open = check_if_port_is_open(port=args.collector_port)
-        if is_port_open:
-            collector_proc, wireshark_proc = start_collector(collector_port=args.collector_port, verbose=args.verbose)
-            processes.extend([collector_proc, wireshark_proc])
-        else:
-            if args.verbose:
-                print(f"{bcolors.FAIL}Port {args.collector_port} is already in use.{bcolors.ENDC}")
-            exit(1)
+        sniff(collector_port=args.collector_port, verbose=args.verbose)
+
+        time.sleep(1)
+        start_capture(serial=serial, collector_ip_address=local_ip_address,
+                      target_app=args.target_app, api_key=args.api_key, verbose=args.verbose)
 
         input("Press any key to terminate.")
     except KeyboardInterrupt:
-        cleanup(processes)
-        stop_capture(api_key=args.api_key, serial=args.serial)
+        stop_capture(api_key=args.api_key, serial=serial)
+    print("Done.")
